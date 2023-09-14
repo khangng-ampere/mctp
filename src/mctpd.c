@@ -126,6 +126,8 @@ struct ctx {
 
 	// Whether we are running as the bus owner
 	bool bus_owner;
+	// Flag for endpoint discovery process;
+	bool discovered;
 
 	// An allocated array of peers, changes address (reallocated) during runtime
 	peer *peers;
@@ -688,6 +690,51 @@ static int handle_control_resolve_endpoint_id(ctx *ctx,
 	return reply_message(ctx, sd, resp, resp_len, addr);
 }
 
+static int handle_control_prepare_endpoint_discovery(ctx *ctx,
+	int sd, const struct sockaddr_mctp_ext *addr,
+	const uint8_t *buf, const size_t buf_size)
+{
+	struct mctp_ctrl_msg_hdr *req = (void*)buf;
+	struct mctp_ctrl_resp_prepare_discovery respi = {0}, *resp = &respi;
+	int rc;
+	mctp_eid_t *addrs;
+	size_t addrs_num;
+
+	if (buf_size < sizeof(*req)) {
+		warnx("short Prepare for Endpoint Discovery message");
+		return -ENOMSG;
+	}
+
+	resp->ctrl_hdr.command_code = req->command_code;
+	resp->ctrl_hdr.rq_dgram_inst = RQDI_RESP;
+
+	if (ctx->verbose && ctx->discovered)
+		fprintf(stderr, "Clearing discovered flag\n");
+	ctx->discovered = false;
+
+
+	// clear local EIDs
+	addrs = mctp_nl_addrs_byindex(ctx->nl, addr->smctp_ifindex, &addrs_num);
+	if (!addrs) {
+		warnx("BUG: cannot get local EIDs at ifindex %d",
+		      addr->smctp_ifindex);
+		return -ENOENT;
+	}
+	for (size_t i = 0; i < addrs_num; i++) {
+		rc = mctp_nl_addr_del(ctx->nl, addrs[i],
+				      mctp_nl_if_byindex(ctx->nl,
+							 addr->smctp_ifindex));
+		if (rc < 0) {
+			errx(rc, "ERR: cannot remove local eid %d ifindex %d",
+			     addrs[i], addr->smctp_ifindex);
+		}
+	}
+	free(addrs);
+
+	// we need to send to physical location, no entry in routing table yet
+	return reply_message_phys(ctx, sd, resp, sizeof(*resp), addr);
+}
+
 static int handle_control_unsupported(ctx *ctx,
 	int sd, const struct sockaddr_mctp_ext *addr,
 	const uint8_t *buf, const size_t buf_size)
@@ -766,6 +813,10 @@ static int cb_listen_control_msg(sd_event_source *s, int sd, uint32_t revents,
 			break;
 		case MCTP_CTRL_CMD_RESOLVE_ENDPOINT_ID:
 			rc = handle_control_resolve_endpoint_id(ctx,
+				sd, &addr, buf, buf_size);
+			break;
+		case MCTP_CTRL_CMD_PREPARE_ENDPOINT_DISCOVERY:
+			rc = handle_control_prepare_endpoint_discovery(ctx,
 				sd, &addr, buf, buf_size);
 			break;
 		default:
