@@ -151,6 +151,8 @@ static int emit_endpoint_added(const peer *peer);
 static int emit_endpoint_removed(const peer *peer);
 static int emit_net_added(ctx *ctx, int net);
 static int emit_net_removed(ctx *ctx, int net);
+static int add_peer(ctx *ctx, const dest_phys *dest, mctp_eid_t eid, int net,
+		    peer **ret_peer);
 static int query_peer_properties(peer *peer);
 static int setup_added_peer(peer *peer);
 static void add_peer_route(peer *peer);
@@ -509,6 +511,31 @@ static int reply_message_phys(ctx *ctx, int sd, const void *resp,
 	return 0;
 }
 
+static int discover_peer_from_ext_addr(ctx *ctx, struct sockaddr_mctp_ext *addr)
+{
+	struct peer *peer;
+	struct dest_phys phys;
+	mctp_eid_t eid;
+	int net;
+	int rc;
+
+	phys.ifindex = addr->smctp_ifindex;
+	memcpy(phys.hwaddr, addr->smctp_haddr, addr->smctp_halen);
+	phys.hwaddr_len = addr->smctp_halen;
+	eid = addr->smctp_base.smctp_addr.s_addr;
+	net = addr->smctp_base.smctp_network;
+
+	rc = add_peer(ctx, &phys, eid, net, &peer);
+	if (rc < 0)
+		return rc;
+
+	rc = setup_added_peer(peer);
+	if (rc < 0)
+		return rc;
+
+	return 0;
+}
+
 // Handles new Incoming Set Endpoint ID request
 static int handle_control_set_endpoint_id(ctx *ctx,
 	int sd, struct sockaddr_mctp_ext *addr,
@@ -517,6 +544,8 @@ static int handle_control_set_endpoint_id(ctx *ctx,
 	struct mctp_ctrl_cmd_set_eid *req = NULL;
 	struct mctp_ctrl_resp_set_eid respi = {0}, *resp = &respi;
 	size_t resp_len;
+	mctp_eid_t eid_set;
+	int rc;
 
 	if (buf_size < sizeof(*req)) {
 		warnx("short Set Endpoint ID message");
@@ -527,12 +556,47 @@ static int handle_control_set_endpoint_id(ctx *ctx,
 	resp->ctrl_hdr.command_code = req->ctrl_hdr.command_code;
 	resp->ctrl_hdr.rq_dgram_inst = RQDI_RESP;
 	resp->completion_code = 0;
-	resp->status = 0x01 << 4; // Already assigned, TODO
-	resp->eid_set = local_addr(ctx, addr->smctp_ifindex);
-	resp->eid_pool_size = 0;
 	resp_len = sizeof(struct mctp_ctrl_resp_set_eid);
 
-	// TODO: learn busowner route and neigh
+	eid_set = local_addr(ctx, addr->smctp_ifindex);
+	if (!eid_set) {
+		const char *linkstr =
+			mctp_nl_if_byindex(ctx->nl, addr->smctp_ifindex);
+
+		rc = mctp_nl_addr_add(ctx->nl, req->eid, linkstr);
+		if (rc < 0) {
+			warnx("ERR: cannot add local eid %d to ifindex %d",
+			      req->eid, addr->smctp_ifindex);
+			return rc;
+		}
+
+		rc = discover_peer_from_ext_addr(ctx, addr);
+		if (rc < 0) {
+			warnx("ERR: cannot discover bus owner");
+			mctp_nl_addr_del(ctx->nl, req->eid, linkstr);
+			return rc;
+		}
+
+		resp->status = 0x00; // Assignment accepted
+		resp->eid_set = req->eid;
+		resp->eid_pool_size = 0;
+		if (ctx->verbose)
+			fprintf(stderr, "Accepted set eid %d\n", req->eid);
+
+	} else {
+		resp->status = 0x01 << 4; // Already assigned
+		resp->eid_set = eid_set;
+		resp->eid_pool_size = 0;
+
+		if (ctx->verbose && req->eid != eid_set)
+			fprintf(stderr,
+				"Rejected set eid %d, already assigned with eid %d\n",
+				req->eid, eid_set);
+	}
+
+	if (ctx->verbose && !ctx->discovered)
+		fprintf(stderr, "Setting discovered flag to true\n");
+	ctx->discovered = true;
 
 	return reply_message(ctx, sd, resp, resp_len, addr);
 }
