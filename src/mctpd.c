@@ -482,6 +482,31 @@ static int reply_message(ctx *ctx, int sd, const void *resp, size_t resp_len,
 	return 0;
 }
 
+/* Replies to a physical address */
+static int reply_message_phys(ctx *ctx, int sd, const void *resp,
+			      size_t resp_len,
+			      const struct sockaddr_mctp_ext *addr)
+{
+	ssize_t len;
+	struct sockaddr_mctp_ext reply_addr = *addr;
+
+	reply_addr.smctp_base.smctp_tag &= ~MCTP_TAG_OWNER;
+
+	len = sendto(sd, resp, resp_len, 0, (struct sockaddr *)&reply_addr,
+		     sizeof(reply_addr));
+
+	if (len < 0) {
+		return -errno;
+	}
+
+	if ((size_t)len != resp_len) {
+		warnx("BUG: short sendto %zd, expected %zu", len, resp_len);
+		return -EPROTO;
+	}
+
+	return 0;
+}
+
 // Handles new Incoming Set Endpoint ID request
 static int handle_control_set_endpoint_id(ctx *ctx,
 	int sd, struct sockaddr_mctp_ext *addr,
