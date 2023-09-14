@@ -735,6 +735,30 @@ static int handle_control_prepare_endpoint_discovery(ctx *ctx,
 	return reply_message_phys(ctx, sd, resp, sizeof(*resp), addr);
 }
 
+static int
+handle_control_endpoint_discovery(ctx *ctx, int sd,
+				  const struct sockaddr_mctp_ext *addr,
+				  const uint8_t *buf, const size_t buf_size)
+{
+	struct mctp_ctrl_msg_hdr *req = (void *)buf;
+	struct mctp_ctrl_resp_endpoint_discovery respi = { 0 }, *resp = &respi;
+
+	if (buf_size < sizeof(*req)) {
+		warnx("short Endpoint Discovery message");
+		return -ENOMSG;
+	}
+
+	if (ctx->discovered) {
+		return 0;
+	}
+
+	resp->ctrl_hdr.command_code = req->command_code;
+	resp->ctrl_hdr.rq_dgram_inst = RQDI_RESP;
+
+	// we need to send to physical location, no entry in routing table yet
+	return reply_message_phys(ctx, sd, resp, sizeof(*resp), addr);
+}
+
 static int handle_control_unsupported(ctx *ctx,
 	int sd, const struct sockaddr_mctp_ext *addr,
 	const uint8_t *buf, const size_t buf_size)
@@ -818,6 +842,10 @@ static int cb_listen_control_msg(sd_event_source *s, int sd, uint32_t revents,
 		case MCTP_CTRL_CMD_PREPARE_ENDPOINT_DISCOVERY:
 			rc = handle_control_prepare_endpoint_discovery(ctx,
 				sd, &addr, buf, buf_size);
+			break;
+		case MCTP_CTRL_CMD_ENDPOINT_DISCOVERY:
+			rc = handle_control_endpoint_discovery(ctx, sd, &addr,
+							       buf, buf_size);
 			break;
 		default:
 			if (ctx->verbose) {
