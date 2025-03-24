@@ -1,6 +1,13 @@
 import pytest
+import asyncdbus
 from mctp_test_utils import *
 from mctpd import *
+
+"""Simple endpoint setup.
+
+Contains one interface (lladdr 0x1d), and one bus-owner (lladdr 0x1d, eid 8),
+that reports support for MCTP control and PLDM.
+"""
 
 @pytest.fixture(name="config")
 def endpoint_config():
@@ -8,8 +15,76 @@ def endpoint_config():
     mode = "endpoint"
     """
 
+@pytest.fixture
+async def sysnet():
+    system = System()
+    iface = System.Interface("mctp0", 1, 1, bytes([0x1D]), 68, 254, True)
+    await system.add_interface(iface)
+    network = Network()
+    network.add_endpoint(Endpoint(iface, bytes([0x10]), eid=8))
+    return Sysnet(system, network)
+
+
 """ Test if mctpd is running as an endpoint """
 async def test_endpoint_role(dbus, mctpd):
     obj = await mctpd_mctp_iface_control_obj(dbus, mctpd.system.interfaces[0])
     role = await obj.get_role()
     assert str(role) == "Endpoint"
+
+
+""" Test if mctpd accepts Set EID when no EID """
+async def test_accept_set_eid(dbus, mctpd):
+    bo = mctpd.network.endpoints[0]
+
+    assert len(mctpd.system.addresses) == 0
+
+    # no EID yet
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x02)
+    assert rsp.hex(' ') == '00 02 00 00 02 00'
+
+    # set EID = 42
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x01, bytes([0x00, 0x42]))
+    assert rsp.hex(' ') == '00 01 00 00 42 00'
+
+    # get EID, expect receive 42 back
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x02)
+    assert rsp.hex(' ') == '00 02 00 42 02 00'
+
+
+""" Test if mctpd rejects Set EID when already have an EID """
+async def test_accept_multiple_set_eids_for_single_interface(dbus, mctpd):
+    bo = mctpd.network.endpoints[0]
+
+    assert len(mctpd.system.addresses) == 0
+
+    # if we are only reachable through one interfaces,
+    # accept all Set EIDs
+    assert len(mctpd.system.interfaces) == 1
+
+    # no EID yet
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x02)
+    assert rsp.hex(' ') == '00 02 00 00 02 00'
+
+    # set EID = 42
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x01, bytes([0x00, 0x42]))
+    assert rsp.hex(' ') == '00 01 00 00 42 00'
+
+    # get EID, expect receive 42 back
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x02)
+    assert rsp.hex(' ') == '00 02 00 42 02 00'
+
+    # set EID = 66
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x01, bytes([0x00, 0x66]))
+    assert rsp.hex(' ') == '00 01 00 00 66 00'
+
+    # get EID, expect receive 66 back
+    rsp = await bo.send_control(mctpd.network.mctp_socket, 0x02)
+    assert rsp.hex(' ') == '00 02 00 66 02 00'
+
+    # expect previous EID removed on D-Bus
+    with pytest.raises(asyncdbus.errors.DBusError) as ex:
+        await mctpd_mctp_endpoint_control_obj(dbus, f"/au/com/codeconstruct/mctp1/networks/1/endpoints/{0x42}")
+    assert str(ex.value) == f"Unknown object '/au/com/codeconstruct/mctp1/networks/1/endpoints/{0x42}'."
+
+    # expect new EID on D-Bus
+    assert await mctpd_mctp_endpoint_control_obj(dbus, f"/au/com/codeconstruct/mctp1/networks/1/endpoints/{0x66}")

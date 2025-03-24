@@ -228,6 +228,12 @@ static int emit_interface_added(struct link *link);
 static int emit_interface_removed(struct link *link);
 static int emit_net_added(struct ctx *ctx, struct net *net);
 static int emit_net_removed(struct ctx *ctx, struct net *net);
+static int add_peer(struct ctx *ctx, const dest_phys *dest, mctp_eid_t eid,
+		    uint32_t net, struct peer **ret_peer);
+static int add_peer_from_addr(struct ctx *ctx,
+			      const struct sockaddr_mctp_ext *addr,
+			      struct peer **ret_peer);
+static int remove_peer(struct peer *peer);
 static int query_peer_properties(struct peer *peer);
 static int setup_added_peer(struct peer *peer);
 static void add_peer_route(struct peer *peer);
@@ -606,25 +612,121 @@ static int handle_control_set_endpoint_id(struct ctx *ctx,
 {
 	struct mctp_ctrl_cmd_set_eid *req = NULL;
 	struct mctp_ctrl_resp_set_eid respi = {0}, *resp = &respi;
+	struct link *link_data;
+	struct peer *peer;
+	mctp_eid_t *addrs;
+	size_t addrs_num;
 	size_t resp_len;
+	int rc;
 
 	if (buf_size < sizeof(*req)) {
-		warnx("short Set Endpoint ID message");
+		bug_warn("short Set Endpoint ID message");
 		return -ENOMSG;
 	}
 	req = (void*)buf;
 
+	link_data = mctp_nl_get_link_userdata(ctx->nl, addr->smctp_ifindex);
+	if (!link_data) {
+		bug_warn("nullptr link data");
+		return -EINVAL;
+	}
+
 	resp->ctrl_hdr.command_code = req->ctrl_hdr.command_code;
 	resp->ctrl_hdr.rq_dgram_inst = RQDI_RESP;
 	resp->completion_code = 0;
-	resp->status = 0x01 << 4; // Already assigned, TODO
-	resp->eid_set = local_addr(ctx, addr->smctp_ifindex);
-	resp->eid_pool_size = 0;
 	resp_len = sizeof(struct mctp_ctrl_resp_set_eid);
 
-	// TODO: learn busowner route and neigh
+	// reject if we are bus owner
+	if (link_data->role == ENDPOINT_ROLE_BUS_OWNER) {
+		warnx("Rejected set EID %d because we are the bus owner",
+		      req->eid);
+		resp->completion_code = MCTP_CTRL_CC_ERROR_UNSUPPORTED_CMD;
+		resp_len = sizeof(resp->ctrl_hdr) + sizeof(resp->completion_code);
+		return reply_message(ctx, sd, resp, resp_len, addr);
+	}
 
-	return reply_message(ctx, sd, resp, resp_len, addr);
+	// error if EID is invalid
+	if (req->eid < 0x08 || req->eid == 0xFF) {
+		warnx("Rejected invalid EID %d", req->eid);
+		resp->completion_code = MCTP_CTRL_CC_ERROR_INVALID_DATA;
+		resp_len = sizeof(resp->ctrl_hdr) + sizeof(resp->completion_code);
+		return reply_message(ctx, sd, resp, resp_len, addr);
+	}
+
+	switch (GET_MCTP_SET_EID_OPERATION(req->operation)) {
+	case MCTP_SET_EID_SET:
+		// TODO: only accept EIDs from originator bus.
+		//
+		// Currently, we assume we are an endpoint only reached through one bus.
+		// In this case, we always accept Set Endpoint ID.
+		//
+		// In the case of multiple buses, we might want to reject non-force EIDs from
+		// non-originator buses.
+		// 
+		// Refer to DSP0236 1.3.3 section 12.4, Set Endpoint ID.
+	case MCTP_SET_EID_FORCE:
+
+		warnx("setting EID to %d", req->eid);
+
+		// Remove all addresses on this interface
+		addrs = mctp_nl_addrs_byindex(ctx->nl, addr->smctp_ifindex,
+					      &addrs_num);
+		if (addrs) {
+			for (size_t i = 0; i < addrs_num; i++) {
+				rc = mctp_nl_addr_del(ctx->nl, addrs[i],
+						      addr->smctp_ifindex);
+				if (rc < 0) {
+					errx(rc,
+					     "ERR: cannot remove local eid %d ifindex %d",
+					     addrs[i], addr->smctp_ifindex);
+				}
+			}
+			free(addrs);
+		}
+
+		// Remove all peers on this interface
+		for (size_t i = 0; i < ctx->num_peers; i++) {
+			struct peer *p = ctx->peers[i];
+			if (p->state == REMOTE &&
+			    p->phys.ifindex == addr->smctp_ifindex) {
+				remove_peer(p);
+			}
+		}
+
+		rc = mctp_nl_addr_add(ctx->nl, req->eid, addr->smctp_ifindex);
+		if (rc < 0) {
+			warnx("ERR: cannot add local eid %d to ifindex %d",
+			      req->eid, addr->smctp_ifindex);
+			resp->completion_code = MCTP_CTRL_CC_ERROR_NOT_READY;
+		}
+
+		rc = add_peer_from_addr(ctx, addr, &peer);
+		if (rc == 0) {
+			rc = setup_added_peer(peer);
+		}
+		if (rc < 0) {
+			warnx("ERR: cannot add bus owner to object lists");
+		}
+
+		SET_MCTP_EID_ASSIGNMENT_STATUS(resp->status,
+					       MCTP_SET_EID_ACCEPTED);
+		SET_MCTP_EID_ALLOCATION_STATUS(resp->status,
+					       MCTP_SET_EID_POOL_NONE);
+		resp->eid_set = req->eid;
+		resp->eid_pool_size = 0;
+		warnx("Accepted set eid %d\n", req->eid);
+		return reply_message(ctx, sd, resp, resp_len, addr);
+
+	case MCTP_SET_EID_DISCOVERED:
+	case MCTP_SET_EID_RESET:
+		// unsupported
+		resp->completion_code = MCTP_CTRL_CC_ERROR_INVALID_DATA;
+		return reply_message(ctx, sd, resp, resp_len, addr);
+
+	default:
+		bug_warn("unreachable Set EID operation code");
+		return -EINVAL;
+	}
 }
 
 static int handle_control_get_version_support(struct ctx *ctx,
@@ -1407,6 +1509,20 @@ static int add_peer(struct ctx *ctx, const dest_phys *dest, mctp_eid_t eid,
 
 	*ret_peer = peer;
 	return 0;
+}
+
+static int add_peer_from_addr(struct ctx *ctx,
+			      const struct sockaddr_mctp_ext *addr,
+			      struct peer **ret_peer)
+{
+	struct dest_phys phys;
+
+	phys.ifindex = addr->smctp_ifindex;
+	memcpy(phys.hwaddr, addr->smctp_haddr, addr->smctp_halen);
+	phys.hwaddr_len = addr->smctp_halen;
+
+	return add_peer(ctx, &phys, addr->smctp_base.smctp_addr.s_addr,
+			addr->smctp_base.smctp_network, ret_peer);
 }
 
 static int check_peer_struct(const struct peer *peer, const struct net *n)

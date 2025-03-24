@@ -423,6 +423,25 @@ async def test_get_endpoint_id(dbus, mctpd):
     # EID matches the system
     assert rsp[3] == mctpd.system.addresses[0].eid
 
+
+""" Test that the mctpd control protocol responder support has support
+for a basic Set Endpoint ID command"""
+async def test_get_endpoint_id(dbus, mctpd):
+    iface = mctpd.system.interfaces[0]
+    dev = mctpd.network.endpoints[0]
+    mctp = await mctpd_mctp_iface_obj(dbus, iface)
+    dev.eid = 12
+
+    await mctpd.system.add_route(mctpd.system.Route(iface, dev.eid, 0))
+    await mctpd.system.add_neighbour(
+        mctpd.system.Neighbour(iface, dev.lladdr, dev.eid)
+    )
+
+    # set EID = 42 and get ERROR_UNSUPPORTED_CMD completion code
+    rsp = await dev.send_control(mctpd.network.mctp_socket, 0x01, bytes([0x00, 0x42]))
+    assert rsp.hex(' ') == '00 01 05'
+
+
 """ During a LearnEndpoint's Get Endpoint ID exchange, return a response
 from a different command; in this case Get Message Type Support, which happens
 to be the same length as a the expected Get Endpoint ID response."""
